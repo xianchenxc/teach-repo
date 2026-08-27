@@ -5,6 +5,7 @@ Vernon 的长期学习课程工作区，由 `teach` skill 持续维护。
 ## 课程
 
 - [PI Agent：架构、Agent Loop 与 SDK 开发](courses/pi-agent/)
+- [日语 N5：旅行交流与系统基础](courses/japanese-n5/)
 
 ## GitHub Pages
 
