@@ -1,0 +1,53 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PI Agent 速通 02：手写最小 SDK Agent</title><link rel="stylesheet" href="../assets/course.css"><style>pre{overflow:auto;background:#20231f;color:#f5f3ec;padding:18px;border-radius:8px;font-size:14px;line-height:1.55}.tag{display:inline-block;padding:3px 8px;border-radius:20px;background:var(--good);font:700 12px ui-monospace}.lab{border-left:5px solid var(--accent2)}.event{font-family:ui-monospace,monospace}.q label{display:block;padding:8px 12px;margin:6px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer}</style></head><body><main class="page"><header><div class="kicker">PI Agent · Intensive 02 · 约 25 分钟</div><h1>手写最小 SDK Agent</h1><p>本课成果：你能从空文件组装一个真正运行的 PI Agent，并在输出中证明“模型调用 → 工具执行 → 第二次模型调用”已经发生。</p><span class="tag">已用 PI 0.84.3 真实运行</span></header><section class="card"><strong>先预测</strong><p>一个最小但完整的工具 Agent，至少需要哪些运行时对象？先写下你的答案，再看下一节。</p></section><h2>1. 五个必要部件</h2><ol class="trace"><li><b>Model / Provider</b>：负责产生 assistant message；本实验使用官方 faux provider，不消耗 API。</li><li><b>Tool schema</b>：用 TypeBox 描述模型允许提交的参数。</li><li><b>Tool execute</b>：应用真正执行副作用或计算的函数。</li><li><b>Agent</b>：拥有 transcript、运行 loop、调度工具。</li><li><b>Subscriber</b>：观察流式文本、工具生命周期和 run 结束。</li></ol><div class="card"><b>为什么用 Faux Provider？</b><p>它不是我们手写的 mock loop，而是 PI 官方 provider，仍然经过真实的 <code>Models.streamSimple</code>、<code>Agent</code>、参数校验、工具执行和事件系统。唯一被脚本化的是模型的两次回答，因此实验免费、确定、可重复。</p></div><h2>2. 先定义工具的类型边界</h2><pre><code>const multiplyParameters = Type.Object({
+  a: Type.Number(),
+  b: Type.Number(),
+});
+
+const multiplyTool: AgentTool&lt;typeof multiplyParameters&gt; = {
+  name: "multiply",
+  label: "Multiply",
+  description: "Multiply two numbers",
+  parameters: multiplyParameters,
+  execute: async (_id, { a, b }) =&gt; ({
+    content: [{ type: "text", text: String(a * b) }],
+    details: { a, b },
+  }),
+};</code></pre><p><b>关键点：</b><code>AgentTool&lt;typeof multiplyParameters&gt;</code> 让 <code>execute</code> 中的 <code>a</code>、<code>b</code> 获得 schema 推导的类型。只写裸 <code>AgentTool</code> 会退化到 <code>unknown</code> 参数。</p><h2>3. 注入模型与创建 Agent</h2><pre><code>const faux = fauxProvider();
+faux.setResponses([
+  fauxAssistantMessage(
+    fauxToolCall("multiply", { a: 6, b: 7 }, { id: "call-1" }),
+    { stopReason: "toolUse" },
+  ),
+  fauxAssistantMessage("6 × 7 = 42."),
+]);
+
+const models = createModels();
+models.setProvider(faux.provider);
+
+const agent = new Agent({
+  initialState: {
+    systemPrompt: "Use tools when needed, then answer concisely.",
+    model: faux.getModel(),
+    tools: [multiplyTool],
+  },
+  streamFn: models.streamSimple.bind(models),
+});</code></pre><p><code>Agent</code> 不直接依赖某家 Provider；它只要求一个符合契约的 <code>streamFn</code>。这正是 PI 分层的实际价值。</p><h2>4. 运行与观察</h2><pre><code>agent.subscribe((event) =&gt; {
+  if (event.type === "message_update" &amp;&amp;
+      event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta);
+  }
+});
+
+await agent.prompt("What is 6 multiplied by 7?");</code></pre><div class="card lab"><b>本机真实输出</b><pre><code>[event] agent_start
+[event] turn_start
+[event] tool_execution_start
+[event] tool_execution_end
+[event] turn_end
+[event] turn_start
+6 × 7 = 42. The tool result has completed the loop.
+[event] turn_end
+[event] agent_end
+
+[roles] user -&gt; assistant -&gt; toolResult -&gt; assistant
+[provider calls] 2</code></pre></div><h3>你应该从输出证明三件事</h3><ul><li>两个 <code>turn_start</code>：模型被调用两次。</li><li>中间出现 <code>tool_execution_start/end</code>：工具由 Runtime 执行。</li><li>roles 中存在 <code>toolResult</code>：结果被写回 transcript，第二轮模型可见。</li></ul><h2>5. 现在亲自运行</h2><div class="card"><p>仓库实验目录：<code>courses/pi-agent/labs/minimal-agent/</code></p><pre><code>npm install --ignore-scripts
+npm start</code></pre><p>源码：<a href="../labs/minimal-agent/src/minimal-agent.ts">minimal-agent.ts</a> · <a href="../labs/minimal-agent/README.md">运行说明</a></p></div><h2>6. 检索练习</h2><form id="quiz"><div class="q"><b>1）最小示例为什么仍需要两次 Provider 调用？</b><label><input type="radio" name="q1" value="0"> 第一次只加载 system prompt</label><label><input type="radio" name="q1" value="1"> 第一次请求工具，第二次读取结果并回答</label><label><input type="radio" name="q1" value="0"> 第二次只负责保存 session</label></div><div class="q"><b>2）真正执行 multiply 的是谁？</b><label><input type="radio" name="q2" value="0"> Faux Provider</label><label><input type="radio" name="q2" value="1"> Agent Runtime 调用工具 execute</label><label><input type="radio" name="q2" value="0"> TypeBox validator</label></div><div class="q"><b>3）TypeBox schema 在这里最直接的职责是什么？</b><label><input type="radio" name="q3" value="1"> 描述并校验工具参数</label><label><input type="radio" name="q3" value="0"> 执行乘法计算</label><label><input type="radio" name="q3" value="0"> 持久化 Agent 消息</label></div><div class="q"><b>4）哪条输出最能证明 tool result 已回填 transcript？</b><label><input type="radio" name="q4" value="0"> agent_start</label><label><input type="radio" name="q4" value="0"> provider calls = 2</label><label><input type="radio" name="q4" value="1"> roles 中出现 toolResult</label></div><button type="button" onclick="grade()">提交</button><div id="result" class="result"></div></form><p class="source">依据 PI 官方源码与 README，版本 <code>0.84.3</code>，源码基线 commit <code>e86823096c5bad39e1ca282ec24bc5eb9bec745b</code>。完成实验后，把测验得分和运行输出中的 <code>[roles]</code> 发给小仔。</p><script>function grade(){let score=0,missing=[];for(let i=1;i<=4;i++){const x=document.querySelector(`input[name=q${i}]:checked`);if(!x)missing.push(i);else score+=Number(x.value)}const r=document.querySelector('#result');r.style.display='block';if(missing.length){r.className='result bad';r.textContent=`还有未回答题目：${missing.join('、')}`;return}r.className='result '+(score>=3?'good':'bad');r.innerHTML=`得分：<b>${score}/4</b><br>${score===4?'你已能把 SDK 代码映射回真实 Agent Loop。下一课进入自定义 Tool、错误与安全钩子。':score>=3?'基本掌握；重新解释一次为什么需要两个 turn。':'请重新沿输出证明三件事，再运行实验。'}`}</script></main></body></html>
