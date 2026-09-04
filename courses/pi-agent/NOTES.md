@@ -7,4 +7,5 @@
 - 主线顺序：架构地图 → loop 源码追踪 → 工具与事件 → SDK 最小实现 → 会话/安全/扩展 → 完整项目。
 - 完整项目暂定：代码库侦察 Agent（只读起步，随后加入报告持久化与可控命令工具）。
 - 第一课已完成：架构与工具调用闭环测验 4/4。
-- 第二课实验采用官方 Faux Provider，避免 API 成本，同时真实经过 Agent Runtime、工具校验执行和双 Turn。
+- 第二课已完成：最小 SDK Agent 实验（官方 Faux Provider，零 API 成本）真实跑通，`[roles] user -> assistant -> toolResult -> assistant` 与源码断言一致，双 Turn 与 toolResult 回填已验证。
+- 下一课：自定义 Tool、错误与安全钩子。
