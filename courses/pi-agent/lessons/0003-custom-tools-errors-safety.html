@@ -1,0 +1,49 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PI Agent 速通 03：自定义 Tool、错误与安全钩子</title><link rel="stylesheet" href="../assets/course.css"><style>pre{overflow-x:auto;max-width:100%;background:#20231f;color:#f5f3ec;padding:18px;border-radius:8px;font:500 15px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:2;-webkit-overflow-scrolling:auto}pre code{display:block;min-width:max-content;background:transparent!important;color:inherit!important;padding:0!important;border-radius:0!important;font:inherit!important;white-space:pre}.tag{display:inline-block;padding:3px 8px;border-radius:20px;background:var(--good);font:700 12px ui-monospace}.lab{border-left:5px solid var(--accent2)}.event{font-family:ui-monospace,monospace}.q label{display:block;padding:8px 12px;margin:6px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer}</style></head><body><main class="page"><header><div class="kicker">PI Agent · Intensive 03 · 约 30 分钟</div><h1>自定义 Tool、错误与安全钩子</h1><p>本课成果：你会写一个会「抛错」的自定义工具，让 Runtime 把错误回填给模型，再用 <code>beforeToolCall</code> / <code>afterToolCall</code> 两道钩子做执行前拦截与执行后审计。</p><span class="tag">已用 PI 0.84.3 真实运行</span></header><section class="card"><strong>先预测</strong><p>工具 <code>execute</code> 里如果出错了，正确做法是返回一个内容为「错误信息」的文本，还是直接 <code>throw</code>？拦截一个危险命令，应该在工具执行<em>之前</em>还是<em>之后</em>？先写下答案。</p></section><h2>1. 工具失败的正确姿势：throw，不要编进 content</h2><p>这是 <code>AgentTool</code> 契约里最反直觉、也最重要的一条。源码注释（<code>types.ts</code>）原话：</p><div class="card"><code>Execute the tool call. Throw on failure instead of encoding errors in <code>content</code>.</code></div><p>为什么？因为 <code>content</code> 是模型能读到的「正常结果」。你把错误塞进去，模型分不清这是成功输出还是失败提示。而 <code>throw</code> 会被 Runtime 捕获，转成一个带 <code>isError: true</code> 标记的结果，语义明确。</p><pre><code>const divideTool: AgentTool&lt;typeof divideParameters&gt; = {
+  name: "divide",
+  label: "Divide",
+  description: "Divide a by b. Throws if b is zero.",
+  parameters: Type.Object({ a: Type.Number(), b: Type.Number() }),
+  execute: async (_id, { a, b }) =&gt; {
+    if (b === 0) throw new Error("Division by zero");   // 错误路径：throw
+    return {
+      content: [{ type: "text", text: String(a / b) }],   // 正常路径：content
+      details: { a, b, quotient: a / b },
+    };
+  },
+};</code></pre><h2>2. 错误如何回到模型：源码里的捕获点</h2><p>在 <code>agent-loop.ts</code> 的 <code>executePreparedToolCall</code> 里，<code>execute</code> 被包在 try/catch 中：</p><ol class="trace"><li><code>prepared.tool.execute(...)</code> 抛出异常。</li><li>catch 分支调用 <code>createErrorToolResult(error.message)</code>，生成 <code>{ content: [{type:"text", text: message}], details: {} }</code>。</li><li>结果被标为 <code>isError: true</code>，最终写进一条 <code>role:"toolResult"</code> 消息。</li><li>下一轮模型调用能看到这条错误消息，从而「看到错误、换个参数重试」。</li></ol><div class="card"><b>不止 execute 会触发错误结果</b>，以下情形都会产生 <code>isError: true</code> 的 toolResult：工具不存在（<code>Tool X not found</code>）、参数校验失败、<code>beforeToolCall</code> 拦截、<code>afterToolCall</code> 自身抛错。它们共用同一条「错误 toolResult」通道。</div><h2>3. 安全钩子一：beforeToolCall 拦截执行</h2><p>在参数校验<em>之后</em>、<code>execute</code> 运行<em>之前</em>调用。返回 <code>{ block: true, reason }</code> 即阻止执行，Runtime 会生成一条错误 toolResult，<code>execute</code> 根本不会运行。</p><pre><code>const agent = new Agent({
+  initialState: { systemPrompt: "...", model, tools: [divideTool, shellTool] },
+  streamFn: models.streamSimple.bind(models),
+
+  beforeToolCall: async ({ toolCall, args }) =&gt; {
+    if (toolCall.name === "shell") {
+      const command = args.command;
+      if (!ALLOWLIST.has(command)) {
+        return { block: true, reason: `Command "${command}" is not in the allowlist` };
+      }
+    }
+    return undefined;  // 不拦截
+  },
+});</code></pre><h2>4. 安全钩子二：afterToolCall 审计 / 改写</h2><p>在 <code>execute</code> 结束<em>之后</em>、结果最终写入前调用。返回的字段会<strong>整字段替换</strong>（<code>content</code>、<code>details</code> 不做深合并），缺省字段保留原值。</p><pre><code>afterToolCall: async ({ toolCall, result, isError }) =&gt; {
+  if (!isError) {
+    // 执行后审计：整体重写 content 和 details
+    return {
+      content: [...result.content, { type: "text", text: " [audited]" }],
+      details: { ...result.details, audited: true },
+    };
+  }
+  return undefined;
+},</code></pre><div class="card"><b>关键边界：</b><code>afterToolCall</code> 只对<em>真正执行过</em>的工具触发（包括 execute 抛错的），对 <code>beforeToolCall</code> 拦截掉的工具<strong>不会</strong>触发——拦截发生在更早的 prepare 阶段，直接走「立即出错」分支。</div><h2>5. 完整实验：一次运行看三个机制</h2><p>脚本让模型依次：成功除法 → 除零抛错 → 换参数重试 → 执行被拦截的 shell 命令 → 收尾回答。五轮模型调用，确定性、零 API 成本。</p><div class="card lab"><b>本机真实输出</b><pre><code>[afterToolCall] divide isError=false
+[tool_result] divide isError=false
+[afterToolCall] divide isError=true
+[tool_result] divide isError=true
+[afterToolCall] divide isError=false
+[tool_result] divide isError=false
+[tool_result] shell isError=true
+Done: recovered from divide-by-zero and a blocked shell command.
+
+[roles] user -&gt; assistant -&gt; toolResult -&gt; assistant -&gt; toolResult -&gt; assistant -&gt; toolResult -&gt; assistant -&gt; toolResult -&gt; assistant
+[provider calls] 5
+[errors] ["Division by zero","Command \"rm -rf /\" is not in the allowlist"]
+[audited] 2
+[verify] all assertions passed</code></pre></div><p>从输出读出三件事：</p><ul><li><b>错误被回填</b>：<code>isError=true</code> 出现在两次 toolResult 上，且 <code>[errors]</code> 里能读到抛错文案与拦截理由。</li><li><b>拦截未执行</b>：<code>shell isError=true</code> 前面<em>没有</em> <code>[afterToolCall] shell ...</code>，证明被拦截的工具根本没进 execute。</li><li><b>审计生效</b>：两次成功除法都经过 <code>afterToolCall</code>，<code>[audited] 2</code> 说明改写已落到结果上。</li></ul><h2>6. 现在亲自运行</h2><div class="card"><p>仓库实验目录：<code>courses/pi-agent/labs/custom-tools-errors-safety/</code></p><pre><code>npm install --ignore-scripts
+npm start</code></pre><p>源码：<a href="../labs/custom-tools-errors-safety/src/custom-tools-errors-safety.ts">custom-tools-errors-safety.ts</a> · <a href="../labs/custom-tools-errors-safety/README.md">运行说明</a></p></div><h2>7. 检索练习</h2><form id="quiz"><div class="q"><b>1）工具 execute 出错时，正确做法是？</b><label><input type="radio" name="q1" value="1"> 直接 throw，交给 Runtime 转成 isError 结果</label><label><input type="radio" name="q1" value="0"> 把错误文案塞进 content 当普通文本返回</label><label><input type="radio" name="q1" value="0"> 静默吞掉错误，返回空 content</label></div><div class="q"><b>2）beforeToolCall 返回 { block: true } 会发生什么？</b><label><input type="radio" name="q2" value="0"> execute 照常运行，结果标记为 error</label><label><input type="radio" name="q2" value="1"> execute 不运行，生成带 reason 的错误 toolResult</label><label><input type="radio" name="q2" value="0"> 整个 Agent 循环直接崩溃退出</label></div><div class="q"><b>3）被 beforeToolCall 拦截的工具，afterToolCall 会触发吗？</b><label><input type="radio" name="q3" value="0"> 会，拦截也算一次执行</label><label><input type="radio" name="q3" value="1"> 不会，拦截走 immediate 分支，跳过 finalize</label><label><input type="radio" name="q3" value="0"> 会，但收到的 isError 恒为 false</label></div><div class="q"><b>4）afterToolCall 返回的字段如何合并？</b><label><input type="radio" name="q4" value="1"> 整字段替换，缺省字段保留原值</label><label><input type="radio" name="q4" value="0"> 深合并进原结果</label><label><input type="radio" name="q4" value="0"> 完全丢弃原结果，只保留返回字段</label></div><button type="button" onclick="grade()">提交</button><div id="result" class="result"></div></form><p class="source">依据 PI 官方源码与 README，版本 <code>0.84.3</code>，源码基线 commit <code>e86823096c5bad39e1ca282ec24bc5eb9bec745b</code>。完成实验后，把测验得分和运行输出里的 <code>[roles]</code>、<code>[errors]</code> 发给小仔。</p><script>function grade(){let score=0,missing=[];for(let i=1;i<=4;i++){const x=document.querySelector(`input[name=q${i}]:checked`);if(!x)missing.push(i);else score+=Number(x.value)}const r=document.querySelector('#result');r.style.display='block';if(missing.length){r.className='result bad';r.textContent=`还有未回答题目：${missing.join('、')}`;return}r.className='result '+(score>=3?'good':'bad');r.innerHTML=`得分：<b>${score}/4</b><br>${score===4?'完美——throw 语义、拦截时机与字段合并边界都掌握了。把得分和运行输出的 [roles]、[errors] 发给小仔即可进入下一课。':score>=3?'不错，回头对照源码再看一遍漏掉的点。':'建议重读第 2、3、4 节，再跑一次实验观察输出。'}`}</script></body></html>
