@@ -8,5 +8,6 @@
 - 完整项目暂定：代码库侦察 Agent（只读起步，随后加入报告持久化与可控命令工具）。
 - 第一课已完成：架构与工具调用闭环测验 4/4。
 - 第二课已完成：最小 SDK Agent 实验（官方 Faux Provider，零 API 成本）真实跑通，`[roles] user -> assistant -> toolResult -> assistant` 与源码断言一致，双 Turn 与 toolResult 回填已验证。
-- 第三课已备好：自定义 Tool、错误与安全钩子。实验 `labs/custom-tools-errors-safety/` 已真实跑通（throw→isError 回填、beforeToolCall 拦截、afterToolCall 审计），等待学员运行并回报 `[roles]`、`[errors]`。
-- 下一课：会话状态与持久化（session state / session-backends）。
+- 第三课已完成：自定义 Tool、错误与安全钩子。测验 4/4，`[roles]` 十段序列与 `[errors]` 两条均与源码断言一致，throw→isError 回填、beforeToolCall 拦截、afterToolCall 审计全部真实跑通。
+- 第四课已备好：会话状态与持久化。实验 `labs/session-state-persistence/` 已真实跑通（AgentState、事件流、JSON 快照→恢复→续跑），等待学员运行并回报 `[roles]`、`[event types]`。
+- 下一课：Extensions、Skills 与 Coding Agent SDK。

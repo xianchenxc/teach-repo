@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PI Agent 速通 04：会话状态与持久化</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+pre{overflow-x:auto;max-width:100%;background:#20231f;color:#f5f3ec;padding:18px;border-radius:8px;font:500 15px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:2;-webkit-overflow-scrolling:auto}
+pre code{display:block;min-width:max-content;background:transparent!important;color:inherit!important;padding:0!important;border-radius:0!important;font:inherit!important;white-space:pre}
+.tag{display:inline-block;padding:3px 8px;border-radius:20px;background:var(--good);font:700 12px ui-monospace}
+.lab{border-left:5px solid var(--accent2)}
+.event{font-family:ui-monospace,monospace}
+.q label{display:block;padding:8px 12px;margin:6px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<div class="kicker">PI Agent · Intensive 04 · 约 30 分钟</div>
+<h1>会话状态与持久化</h1>
+<p>本课成果：你会看清 <code>Agent</code> 到底「拥有」哪些状态，读懂一条完整的事件流，并把一场对话序列化成 JSON、在一个全新进程里恢复并接着聊。</p>
+<span class="tag">已用 PI 0.84.3 真实运行</span>
+</header>
+
+<section class="card">
+<strong>先预测</strong>
+<p>如果要把一个 Agent 的对话「关掉再打开」，你需要保存什么？是保存 <code>systemPrompt</code>，还是保存消息列表 <code>messages</code>，还是保存工具定义？先写下答案，再看下文。</p>
+</section>
+
+<h2>1. AgentState：Agent 到底拥有哪些状态</h2>
+<p>前几课我们一直在 <code>initialState</code> 里传 <code>systemPrompt</code> / <code>model</code> / <code>tools</code>，运行后又读 <code>agent.state.messages</code>。这一节把它们一次说清。<code>types.ts</code> 里的 <code>AgentState</code> 长这样：</p>
+<pre><code>interface AgentState {
+  systemPrompt: string;          // 每次请求都携带的系统提示
+  model: Model&lt;any&gt;;              // 后续 turn 使用的模型
+  thinkingLevel: ThinkingLevel;   // 推理级别（off / low / medium / high ...）
+  set tools(tools); get tools();  // 赋值新数组 → 拷贝顶层数组
+  set messages(msgs); get messages(); // 同上，会话转录
+  readonly isStreaming: boolean;      // 是否正在处理 prompt/continuation
+  readonly streamingMessage?;         // 当前流式回答的部分消息
+  readonly pendingToolCalls;          // 正在执行的 tool call id 集合
+  readonly errorMessage?;             // 最近一次失败/中止的 turn 错误
+}</code></pre>
+<p>关键边界：<code>tools</code> 和 <code>messages</code> 是 <strong>accessor 属性</strong>——你给它们赋新数组时，Agent 会先拷贝顶层数组再存。所以外部改原数组不会悄悄污染 Agent 的内部状态。而 <code>isStreaming</code> / <code>streamingMessage</code> / <code>pendingToolCalls</code> / <code>errorMessage</code> 是运行时字段，只读、由 loop 维护，不属于「持久化」的范畴。</p>
+
+<h2>2. 事件流：一次 run 的完整生命周期</h2>
+<p><code>agent.subscribe(listener)</code> 订阅的 <code>AgentEvent</code> 是一个联合类型，覆盖三类事件——agent 生命周期、turn 生命周期、消息生命周期、工具执行生命周期。本实验真实观测到的顺序（去重后）是：</p>
+<pre><code>[event types] agent_start -&gt; turn_start -&gt; message_start -&gt; message_end
+           -&gt; message_update -&gt; tool_execution_start -&gt; tool_execution_end
+           -&gt; turn_end -&gt; agent_end</code></pre>
+<p>逐条读：</p>
+<ul>
+<li><code>agent_start</code> / <code>agent_end</code> —— 一次 run 的起止。注意 <code>agent_end</code> 是 run 发出的<em>最后一个</em>事件，但 awaited 的 <code>agent_end</code> listener 全部 settle 之后，Agent 才算真正 idle。</li>
+<li><code>turn_start</code> / <code>turn_end</code> —— 一个 turn = 一次 assistant 回答 + 它触发的全部工具调用与结果。本实验 session 1 有两个 turn（调用工具 + 收尾回答）。</li>
+<li><code>message_start</code> / <code>message_update</code> / <code>message_end</code> —— 消息生命周期。<code>message_update</code> 只在 assistant 流式输出时触发，一次回答会触发多次（每个 text delta 一次）。</li>
+<li><code>tool_execution_start</code> / <code>tool_execution_update</code> / <code>tool_execution_end</code> —— 工具执行生命周期。</li>
+</ul>
+
+<h2>3. 持久化：快照 → 恢复 → 续跑</h2>
+<p>PI 的核心 Agent 本身不做磁盘落盘——它把「会话」完整地暴露在 <code>agent.state.messages</code> 里（一条条 <code>user</code> / <code>assistant</code> / <code>toolResult</code> 消息，全 JSON 可序列化，<code>timestamp</code> 是数字）。持久化的本质就是：<strong>序列化这条转录，下次用 <code>initialState.messages</code> 交还给一个新 Agent</strong>。</p>
+<pre><code>// 会话 1 结束后，落盘快照
+const snapshot = JSON.stringify({
+  systemPrompt: agentA.state.systemPrompt,
+  modelId: agentA.state.model.id,
+  messages: agentA.state.messages,   // 转录本体
+});
+
+// 新进程里，恢复并接着聊
+const restored = JSON.parse(snapshot);
+const agentB = new Agent({
+  initialState: {
+    systemPrompt: restored.systemPrompt,
+    model: faux.getModel(),
+    tools: [rememberTool],
+    messages: restored.messages,     // ← 续跑的关键
+  },
+  streamFn: models.streamSimple.bind(models),
+});</code></pre>
+<p>要点：<code>toolResult</code> 消息和普通消息一样会被持久化——所以恢复后，模型仍然「记得」之前调用过什么工具、得到了什么结果。想清空会话则调 <code>agent.reset()</code>（会清空 messages 与运行时状态，且正在处理时会抛错拒绝）。</p>
+
+<h2>4. 上下文窗口管理：transformContext</h2>
+<p>持久化的转录会越攒越长，迟早顶到模型的上下文窗口。<code>AgentLoopConfig</code> 里有两个专门钩子：</p>
+<ul>
+<li><code>transformContext(messages)</code> —— 在 <code>convertToLlm</code> <em>之前</em>、针对 <code>AgentMessage[]</code> 做裁剪/注入（比如截掉最旧的几轮、拼接外部资料）。</li>
+<li><code>convertToLlm(messages)</code> —— 把 <code>AgentMessage[]</code> 转成 LLM 能懂的 <code>Message[]</code>，默认过滤掉非 user/assistant/toolResult 的自定义消息。</li>
+</ul>
+<p>两者契约一致：<strong>不 throw、不 reject</strong>，返回原数组或安全回退值。</p>
+
+<h2>5. 官方 session-backends（概览）</h2>
+<p>生产级持久化不必手写快照。PI 提供 <code>@earendil-works/pi-session-backend-sqlite-node</code>，用 <code>node:sqlite</code> 做适配器，提供 SQLite 会话仓库、迁移、物化视图和可选的 FTS 全文搜索：</p>
+<pre><code>await using repository = new SqliteSessionRepository(options);
+const search = createSqliteSessionSearch(options);
+const session = await repository.create({ cwd });
+await session.appendMessage(message);
+
+for await (const hit of search.search("needle")) { /* ... */ }</code></pre>
+<p>本课实验只用手写快照（零依赖、零 API 成本、足够讲清机制）；生产项目再引入官方 backend。Agent 构造函数还接受 <code>sessionId</code>，会转发给 provider 用于缓存感知的 backend。</p>
+
+<h2>6. 完整实验：一次运行看状态、事件与持久化</h2>
+<p>脚本跑两个「会话」：会话 1 让模型调用 <code>remember</code> 工具存一条事实并确认；然后序列化转录、恢复进一个新 Agent；会话 2 追问「我之前说过什么」，模型基于恢复的转录答出那条事实。零 API 成本、确定性输出。</p>
+<div class="card lab">
+<b>本机真实输出</b>
+<pre><code>[session-1 roles] user -&gt; assistant -&gt; toolResult -&gt; assistant
+[snapshot] 4 messages, &lt;N&gt; bytes
+[restored roles] user -&gt; assistant -&gt; toolResult -&gt; assistant
+[session-2 roles] user -&gt; assistant -&gt; toolResult -&gt; assistant -&gt; user -&gt; assistant
+[event types] agent_start -&gt; turn_start -&gt; message_start -&gt; message_end -&gt; message_update -&gt; tool_execution_start -&gt; tool_execution_end -&gt; turn_end -&gt; agent_end
+[provider calls] 3
+[verify] all assertions passed</code></pre>
+</div>
+<p>从输出读出三件事：</p>
+<ul>
+<li><b>状态可序列化</b>：会话 1 的 4 条消息（含 toolResult）被 JSON 快照，恢复后 <code>[restored roles]</code> 与之一致。</li>
+<li><b>转录可续跑</b>：会话 2 在 4 条恢复消息后追加新的 user/assistant，得到 6 段序列，且模型答出了持久化的事实。</li>
+<li><b>事件覆盖完整生命周期</b>：一次带工具的 run 从 <code>agent_start</code> 走到 <code>agent_end</code>，中间经过消息、工具、turn 三类事件。</li>
+</ul>
+
+<h2>7. 现在亲自运行</h2>
+<div class="card">
+<p>仓库实验目录：<code>courses/pi-agent/labs/session-state-persistence/</code></p>
+<pre><code>npm install --ignore-scripts
+npm start</code></pre>
+<p>源码：<a href="../labs/session-state-persistence/src/session-state-persistence.ts">session-state-persistence.ts</a> · <a href="../labs/session-state-persistence/README.md">运行说明</a></p>
+</div>
+
+<h2>8. 检索练习</h2>
+<form id="quiz">
+<div class="q"><b>1）<code>AgentState</code> 的 <code>tools</code> 和 <code>messages</code> 是 accessor 属性，意味着？</b>
+<label><input type="radio" name="q1" value="1"> 赋值新数组时，Agent 先拷贝顶层数组再存储</label>
+<label><input type="radio" name="q1" value="0"> 直接引用原数组，外部修改会实时生效</label>
+<label><input type="radio" name="q1" value="0"> 它们是只读的，运行时不能修改</label>
+</div>
+<div class="q"><b>2）要让新进程里的 Agent「接上」上一轮对话，正确做法是？</b>
+<label><input type="radio" name="q2" value="1"> 把持久化的 messages 通过 initialState 传给新 Agent</label>
+<label><input type="radio" name="q2" value="0"> 只用同样的 systemPrompt 和 tools 重构即可，messages 会自愈</label>
+<label><input type="radio" name="q2" value="0"> 调用 agent.resume() 方法自动恢复</label>
+</div>
+<div class="q"><b>3）一次 run 中，<code>agent_end</code> 事件的语义是？</b>
+<label><input type="radio" name="q3" value="1"> 该 run 发出的最后一个事件，但 awaited 的 listener 完成前 agent 不算 idle</label>
+<label><input type="radio" name="q3" value="0"> 表示整个 Node 进程即将退出</label>
+<label><input type="radio" name="q3" value="0"> 表示模型返回了最终文本回答</label>
+</div>
+<div class="q"><b>4）<code>transformContext</code> 钩子的典型用途是？</b>
+<label><input type="radio" name="q4" value="1"> 上下文窗口管理：裁剪旧消息、注入外部上下文，契约是不 throw</label>
+<label><input type="radio" name="q4" value="0"> 把 AgentMessage 转成 LLM 能懂的 Message（这是 convertToLlm 的活）</label>
+<label><input type="radio" name="q4" value="0"> 在工具执行前拦截危险调用</label>
+</div>
+<button type="button" onclick="grade()">提交</button>
+<div id="result" class="result"></div>
+</form>
+
+<p class="source">依据 PI 官方源码与 README，版本 <code>0.84.3</code>，源码基线 commit <code>e86823096c5bad39e1ca282ec24bc5eb9bec745b</code>。完成实验后，把测验得分和运行输出里的 <code>[session-2 roles]</code>、<code>[event types]</code> 发给小仔。</p>
+
+<script>
+function grade(){let score=0,missing=[];for(let i=1;i<=4;i++){const x=document.querySelector(`input[name=q${i}]:checked`);if(!x)missing.push(i);else score+=Number(x.value)}const r=document.querySelector('#result');r.style.display='block';if(missing.length){r.className='result bad';r.textContent=`还有未回答题目：${missing.join('、')}`;return}r.className='result '+(score>=3?'good':'bad');r.innerHTML=`得分：<b>${score}/4</b><br>${score===4?'完美——状态字段、事件生命周期与快照恢复边界都掌握了。把得分和运行输出里的 [session-2 roles]、[event types] 发给小仔即可进入下一课。':score>=3?'不错，回头对照源码再看一遍漏掉的点。':'建议重读第 1、2、3 节，再跑一次实验观察输出。'}`}
+</script>
+</body>
+</html>
