@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PI Agent 速通 05：Extensions、Skills 与 Coding Agent SDK</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+pre{overflow-x:auto;max-width:100%;background:#20231f;color:#f5f3ec;padding:18px;border-radius:8px;font:500 15px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:2;-webkit-overflow-scrolling:auto}
+pre code{display:block;min-width:max-content;background:transparent!important;color:inherit!important;padding:0!important;border-radius:0!important;font:inherit!important;white-space:pre}
+.tag{display:inline-block;padding:3px 8px;border-radius:20px;background:var(--good);font:700 12px ui-monospace}
+.lab{border-left:5px solid var(--accent2)}
+.q label{display:block;padding:8px 12px;margin:6px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<div class="kicker">PI Agent · Intensive 05 · 约 40 分钟</div>
+<h1>Extensions、Skills 与 Coding Agent SDK</h1>
+<p>本课成果：你会用三种 PI 提供的扩展机制——<b>Skills</b>（知识注入）、<b>Extensions</b>（TypeScript 钩子与自定义工具）、<b>Coding Agent SDK</b>（把 pi 嵌进自己的应用）——并真实跑通一次「技能发现 → 扩展注册工具 → SDK 起会话」的完整链路。</p>
+<span class="tag">已用 PI 0.84.3 真实运行</span>
+</header>
+
+<section class="card">
+<strong>先预测</strong>
+<p>给 Agent 加「专长」和给 Agent 加「工具」，是同一件事吗？Skills 和 Extensions 各自解决什么问题？先写下答案。</p>
+</section>
+
+<h2>1. Skills：把专长知识注入系统提示</h2>
+<p>Skill 是一个带 frontmatter 的 <code>SKILL.md</code> 文件，描述「模型在什么场景该加载这份知识」。它的 frontmatter 只有 <code>description</code> 是<strong>必须的</strong>——<code>name</code> 缺了会回退到父目录名，<code>description</code> 缺了则整条跳过。</p>
+<pre><code>---
+name: browser-testing
+description: Drive a headless browser to exercise and verify web UIs.
+disable-model-invocation: false
+---
+
+# Browser Testing
+Use Playwright to open pages, click, and assert.</code></pre>
+<p>发现规则（<code>skills.ts</code>）：从项目 <code>.pi/skills/</code> 和用户 <code>~/.pi/agent/skills/</code> 递归扫描，遇到含 <code>SKILL.md</code> 的目录就当作一个 skill 根、不再下钻。name 需匹配 <code>[a-z0-9-]+</code>（小写、数字、连字符，≤64 字符）。</p>
+<p>Skills 并不直接拼进每条消息，而是被 <code>formatSkillsForPrompt</code> 渲染成一段 XML，注入系统提示的 <code>&lt;available_skills&gt;</code> 块；模型按需用 <code>read</code> 工具去加载具体文件。设了 <code>disable-model-invocation: true</code> 的 skill 不进入该块，只能靠 <code>/skill:name</code> 显式触发。</p>
+<pre><code>&lt;available_skills&gt;
+  &lt;skill&gt;
+    &lt;name&gt;browser-testing&lt;/name&gt;
+    &lt;description&gt;Drive a headless browser to exercise and verify web UIs.&lt;/description&gt;
+    &lt;location&gt;/path/.pi/skills/browser-testing/SKILL.md&lt;/location&gt;
+  &lt;/skill&gt;
+&lt;/available_skills&gt;</code></pre>
+
+<h2>2. Extensions：TypeScript 钩子与自定义工具</h2>
+<p>Extension 是一个导出默认函数的 TypeScript 模块，函数签收一个 <code>ExtensionAPI</code>（<code>pi</code>）。它统一承载三类能力——事件钩子、自定义工具、斜杠命令：</p>
+<pre><code>import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI) {
+  // ① 事件钩子：观察/拦截 agent 生命周期
+  pi.on("agent_start", () =&gt; console.log("starting"));
+  pi.on("tool_call", (event) =&gt; {
+    console.log(`tool: ${event.toolName}`);
+    // 返回 { block: true, reason: "..." } 可拦截该工具
+    return undefined;
+  });
+
+  // ② 注册自定义工具
+  pi.registerTool({
+    name: "shout",
+    label: "Shout",
+    description: "Return the given text uppercased.",
+    parameters: Type.Object({ text: Type.String() }),
+    execute: async (_id, { text }) =&gt; ({
+      content: [{ type: "text", text: text.toUpperCase() }],
+      details: { text },
+    }),
+  });
+
+  // ③ 注册斜杠命令
+  pi.registerCommand("mycommand", {
+    description: "Do something",
+    handler: async (args, ctx) =&gt; ctx.ui.notify(`got ${args}`),
+  });
+}</code></pre>
+<p>事件钩子覆盖完整生命周期：<code>agent_start</code> / <code>turn_start</code> / <code>tool_call</code> / <code>tool_execution_start</code> / <code>tool_execution_end</code> / <code>agent_end</code> / <code>agent_settled</code> 等，也能挂到更底层的 <code>context</code>、<code>before_provider_headers</code>、<code>after_provider_response</code>。扩展默认从 <code>~/.pi/agent/extensions/</code>、<code>&lt;cwd&gt;/.pi/extensions/</code>、settings.json 的 <code>extensions</code> 数组发现，也可通过 <code>extensionFactories</code> 内联注册。</p>
+
+<h2>3. Coding Agent SDK：把 pi 嵌进自己的应用</h2>
+<p>上一课的 <code>Agent</code> 是低层运行时；pi 另提供一层 <code>createAgentSession()</code>，把模型、工具、技能、扩展、会话持久化打包成一个可直接驱动的会话。核心签名：</p>
+<pre><code>const { session, extensionsResult, modelFallbackMessage } =
+  await createAgentSession({
+    model,                 // 模型（缺省从 settings / 首个可用）
+    modelRuntime,          // 模型与鉴权运行时
+    thinkingLevel,         // off / low / medium / high
+    tools: ["read", "shout"], // 工具名 allowlist（跨内置/扩展/自定义）
+    customTools: [...],    // 额外的自定义工具
+    resourceLoader,        // 技能/扩展/提示词/主题的资源加载器
+    sessionManager,        // 会话持久化（inMemory / 落盘）
+    settingsManager,
+  });
+
+session.subscribe((event) =&gt; { /* message_update, tool_execution_*, agent_settled */ });
+await session.prompt("Shout the phrase.");</code></pre>
+<p>关键点：<code>tools</code> 是一个<strong>跨来源的 allowlist</strong>——它同时约束内置工具（read/bash/edit/write）、扩展工具、自定义工具。你注册了 <code>shout</code> 但没把它列进 <code>tools</code>，它就不会启用。</p>
+
+<h2>4. 完整实验：一次运行看三件事</h2>
+<p>脚本先在一个临时项目里放两个合法 <code>SKILL.md</code> 加一个「缺 description」的非法技能；再用 <code>registerFauxProvider</code> 注入脚本化模型（零 API 成本），内联注册一个扩展（记事件 + 注册 <code>shout</code> 工具），最后用 <code>createAgentSession</code> 起会话跑一轮。</p>
+<div class="card lab">
+<b>本机真实输出</b>
+<pre><code>[skills] browser-testing, code-review
+[skill diagnostics] 1
+[skills prompt]
+&lt;available_skills&gt;
+  &lt;skill&gt;&lt;name&gt;browser-testing&lt;/name&gt;...&lt;/skill&gt;
+  &lt;skill&gt;&lt;name&gt;code-review&lt;/name&gt;...&lt;/skill&gt;
+&lt;/available_skills&gt;
+
+[roles] user -&gt; assistant -&gt; toolResult -&gt; assistant
+[extension events] agent_start -&gt; tool_call:shout -&gt; agent_end:4
+[provider calls] 2
+[verify] all assertions passed</code></pre>
+</div>
+<p>从输出读出三件事：</p>
+<ul>
+<li><b>Skills 被正确发现与过滤</b>：两个合法技能进列表，缺 description 的那个被跳过并产生 1 条诊断。</li>
+<li><b>扩展的钩子真实触发</b>：<code>agent_start</code> → <code>tool_call:shout</code> → <code>agent_end:4</code>，与运行生命周期一致。</li>
+<li><b>扩展工具被 SDK 端到端调用</b>：模型调用 <code>shout</code>，得到 <code>user -&gt; assistant -&gt; toolResult -&gt; assistant</code> 的完整闭环。</li>
+</ul>
+
+<h2>5. 现在亲自运行</h2>
+<div class="card">
+<p>仓库实验目录：<code>courses/pi-agent/labs/skills-extensions-sdk/</code></p>
+<pre><code>npm install --ignore-scripts
+npm start</code></pre>
+<p>源码：<a href="../labs/skills-extensions-sdk/src/skills-extensions-sdk.ts">skills-extensions-sdk.ts</a> · <a href="../labs/skills-extensions-sdk/README.md">运行说明</a></p>
+</div>
+
+<h2>6. 检索练习</h2>
+<form id="quiz">
+<div class="q"><b>1）<code>SKILL.md</code> 的 frontmatter 里，哪个字段是必须的？</b>
+<label><input type="radio" name="q1" value="1"> description——缺了它整个 skill 被跳过</label>
+<label><input type="radio" name="q1" value="0"> name——缺了就报错不加载</label>
+<label><input type="radio" name="q1" value="0"> disable-model-invocation——缺了就默认禁止调用</label>
+</div>
+<div class="q"><b>2）Skills 是怎么进入模型上下文的？</b>
+<label><input type="radio" name="q2" value="1"> 被渲染成 &lt;available_skills&gt; XML 块注入系统提示，模型按需用 read 工具加载</label>
+<label><input type="radio" name="q2" value="0"> 全文复制进每一条 user 消息</label>
+<label><input type="radio" name="q2" value="0"> 只在用户输入 /skill:name 时才拼进上下文</label>
+</div>
+<div class="q"><b>3）扩展（Extension）的本质是？</b>
+<label><input type="radio" name="q3" value="1"> 一个导出 default (pi: ExtensionAPI) =&gt; void 的 TS 模块，用 pi.on / pi.registerTool / pi.registerCommand 挂钩子</label>
+<label><input type="radio" name="q3" value="0"> 一个声明式 YAML 配置文件</label>
+<label><input type="radio" name="q3" value="0"> 一个由 pi 定时执行的 shell 脚本</label>
+</div>
+<div class="q"><b>4）<code>createAgentSession</code> 的 <code>tools</code> 参数语义是？</b>
+<label><input type="radio" name="q4" value="1"> 跨来源的 allowlist——同时约束内置、扩展、自定义工具，未列出的不启用</label>
+<label><input type="radio" name="q4" value="0"> 只约束内置工具，扩展/自定义工具永远启用</label>
+<label><input type="radio" name="q4" value="0"> 一个 denylist，列出的工具被禁用</label>
+</div>
+<button type="button" onclick="grade()">提交</button>
+<div id="result" class="result"></div>
+</form>
+
+<p class="source">依据 PI 官方源码与 README，版本 <code>0.84.3</code>，源码基线 commit <code>e86823096c5bad39e1ca282ec24bc5eb9bec745b</code>。完成实验后，把测验得分和运行输出里的 <code>[skills]</code>、<code>[roles]</code>、<code>[extension events]</code> 发给小仔。</p>
+
+<script>
+function grade(){let score=0,missing=[];for(let i=1;i<=4;i++){const x=document.querySelector(`input[name=q${i}]:checked`);if(!x)missing.push(i);else score+=Number(x.value)}const r=document.querySelector('#result');r.style.display='block';if(missing.length){r.className='result bad';r.textContent=`还有未回答题目：${missing.join('、')}`;return}r.className='result '+(score>=3?'good':'bad');r.innerHTML=`得分：<b>${score}/4</b><br>${score===4?'完美——Skills 注入、Extension 钩子与 SDK allowlist 语义都掌握了。把得分和运行输出里的 [skills]、[roles]、[extension events] 发给小仔即可进入最后一课。':score>=3?'不错，回头对照源码再看一遍漏掉的点。':'建议重读第 1、2、3 节，再跑一次实验观察输出。'}`}
+</script>
+</body>
+</html>
