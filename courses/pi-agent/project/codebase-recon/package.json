@@ -1,0 +1,16 @@
+{
+  "name": "pi-codebase-recon-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/recon-agent.ts",
+    "demo": "tsx src/recon-demo.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.3",
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

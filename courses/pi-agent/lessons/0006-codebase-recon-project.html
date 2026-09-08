@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PI Agent 最终项目：代码库侦察 Agent</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+pre{overflow-x:auto;max-width:100%;background:#20231f;color:#f5f3ec;padding:18px;border-radius:8px;font:500 15px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:2;-webkit-overflow-scrolling:auto}
+pre code{display:block;min-width:max-content;background:transparent!important;color:inherit!important;padding:0!important;border-radius:0!important;font:inherit!important;white-space:pre}
+.tag{display:inline-block;padding:3px 8px;border-radius:20px;background:var(--good);font:700 12px ui-monospace}
+table{border-collapse:collapse;width:100%;margin:16px 0}
+th,td{border:1px solid var(--line);padding:10px 12px;text-align:left;font-size:15px}
+th{background:var(--paper)}
+</style>
+</head>
+<body>
+<main class="page">
+<header>
+<div class="kicker">PI Agent · Capstone · 最终项目</div>
+<h1>代码库侦察 Agent</h1>
+<p>本课成果：把五课速通学到的能力拼成一个<b>真实可运行的 Agent</b>——给定一个仓库路径，用只读工具探查，产出一份结构化侦察报告并持久化到磁盘。</p>
+<span class="tag">已用 PI 0.84.3 真实运行</span>
+</header>
+
+<section class="card">
+<strong>任务</strong>
+<p>构建一个「代码库侦察 Agent」：它只能<em>读</em>（read / grep / find / ls），不能改任何项目文件；侦察结束后把报告用自定义工具 <code>save-report</code> 写入目标仓库的 <code>RECON_REPORT.md</code>。</p>
+</section>
+
+<h2>1. 这份项目对应五课的哪些能力</h2>
+<table>
+<tr><th>能力</th><th>来自</th><th>在项目里的落点</th></tr>
+<tr><td>Agent 运行时 + 工具 + 双 Turn 闭环</td><td>第 2 课</td><td>模型「读文件 → 出报告」的多轮流程</td></tr>
+<tr><td>自定义工具 + throw 语义</td><td>第 3 课</td><td><code>save-report</code> 工具（参数校验、执行、结果回填）</td></tr>
+<tr><td>持久化思路</td><td>第 4 课</td><td>把侦察结果落到 <code>RECON_REPORT.md</code></td></tr>
+<tr><td>SDK + 跨来源 allowlist</td><td>第 5 课</td><td><code>createAgentSession</code> + <code>customTools</code> + <code>tools</code> allowlist</td></tr>
+</table>
+
+<h2>2. 项目结构</h2>
+<pre><code>project/codebase-recon/
+├── src/recon-agent.ts   # 真实 Agent（read/grep/find/ls + save-report）
+├── src/recon-demo.ts    # 零成本验证（脚本化 faux 模型）
+├── package.json
+└── README.md</code></pre>
+<p>两个入口：</p>
+<ul>
+<li><b><code>npm run demo</code></b> —— 零成本。用脚本化 faux 模型跑一遍相同接线，证明 SDK + 自定义工具 + 报告持久化真实可用，无需任何 API key。</li>
+<li><b><code>npm start [仓库路径]</code></b> —— 真实运行。需要已配置的 provider（<code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code> 或 <code>pi login</code>），对真实仓库产出报告。</li>
+</ul>
+
+<h2>3. 零成本验证的真实输出（本机已跑通）</h2>
+<div class="card lab">
+<pre><code>[roles] user -&gt; assistant -&gt; toolResult -&gt; assistant
+[provider calls] 2
+[report exists] true
+[report] # Recon Report | - purpose: toy project | - stack: TypeScript
+[verify] all assertions passed</code></pre>
+</div>
+<p>这条输出读出的关键：模型调用 <code>save-report</code> 工具 → 工具把报告写到磁盘（<code>report exists: true</code>）→ 结果回填（<code>toolResult</code>）→ 模型收尾。一次完整闭环。</p>
+
+<h2>4. 完成标准（definition of done）</h2>
+<ol class="trace">
+<li><code>npm run demo</code> 全绿，输出里的 <code>[roles]</code> 与 <code>[report]</code> 如上。</li>
+<li>（可选加分）配好 provider 后 <code>npm start &lt;一个真实仓库&gt;</code>，把生成的 <code>RECON_REPORT.md</code> 摘一段发来。</li>
+</ol>
+
+<h2>5. 现在动手</h2>
+<div class="card">
+<pre><code>cd courses/pi-agent/project/codebase-recon
+npm install --ignore-scripts
+npm run demo</code></pre>
+<p>源码：<a href="../project/codebase-recon/src/recon-demo.ts">recon-demo.ts</a> · <a href="../project/codebase-recon/src/recon-agent.ts">recon-agent.ts</a> · <a href="../project/codebase-recon/README.md">README</a></p>
+</div>
+
+<p class="source">依据 PI 官方源码与 README，版本 <code>0.84.3</code>，源码基线 commit <code>e86823096c5bad39e1ca282ec24bc5eb9bec745b</code>。完成 <code>npm run demo</code> 后，把输出里的 <code>[roles]</code> 和 <code>[report]</code> 发给小仔，即代表整条「从 Agent Loop 到完整 SDK Agent」学习路线通关。</p>
+</body>
+</html>
